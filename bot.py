@@ -1,21 +1,18 @@
-import threading
 import asyncio
-import random
-from datetime import datetime, timedelta
-import os
 from flask import Flask, request, jsonify
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
 
-# ---------------- CONFIG ----------------
-TOKEN = os.environ.get("BOT_TOKEN")  # set BOT_TOKEN in Render environment variables
-bot = Bot(TOKEN)
-active_giveaways = {}  # message_id: {title, winners, participants, end_time, channel_id}
+import os, random
+from datetime import datetime, timedelta
 
-# ---------------- FLASK APP ----------------
+TOKEN = os.environ.get("BOT_TOKEN")
+bot = Bot(TOKEN)
+active_giveaways = {}
+
 app = Flask(__name__)
 
-# ---------------- TELEGRAM BOT HANDLERS ----------------
+# ---------------- TELEGRAM HANDLERS ----------------
 async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -23,7 +20,6 @@ async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = query.from_user.username or query.from_user.first_name
     msg_id = query.message.message_id
     chat_id = query.message.chat.id
-
     giveaway = active_giveaways.get(msg_id)
     if giveaway and giveaway["channel_id"] == chat_id:
         if user_id not in giveaway["participants"]:
@@ -77,7 +73,7 @@ async def giveaway_countdown(msg_id):
             await update_message(giveaway, msg_id, giveaway["channel_id"])
         await asyncio.sleep(60)
 
-# ---------------- FLASK API ROUTE ----------------
+# ---------------- FLASK API ----------------
 @app.route("/create_giveaway", methods=["POST"])
 def create_giveaway():
     data = request.json
@@ -85,14 +81,11 @@ def create_giveaway():
     winners = data.get("winners")
     duration = data.get("duration")
     channel_id = int(data.get("channel_id"))
-    
     if not all([title, winners, duration, channel_id]):
         return jsonify({"status": "error", "message": "Missing fields"}), 400
 
     end_time = datetime.now() + timedelta(minutes=duration)
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎟 JOIN", callback_data="join_inline")]])
-
-    # Send message via bot
     try:
         msg = asyncio.run(bot.send_message(
             chat_id=channel_id,
@@ -115,25 +108,17 @@ def create_giveaway():
         "end_time": end_time,
         "channel_id": channel_id
     }
-
-    # Start countdown in background
     asyncio.create_task(giveaway_countdown(msg.message_id))
     return jsonify({"status": "success", "message_id": msg.message_id})
 
-# ---------------- START BOT ----------------
-async def start_bot():
+# ---------------- MAIN ----------------
+async def main():
     bot_app = ApplicationBuilder().token(TOKEN).build()
     bot_app.add_handler(CallbackQueryHandler(join_callback))
+    # Run Flask in executor
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))))
     await bot_app.run_polling()
 
-# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-
-    # Start Telegram bot in a separate thread
-    threading.Thread(target=lambda: asyncio.run(start_bot()), daemon=True).start()
-
-    # Start Flask API
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(main())

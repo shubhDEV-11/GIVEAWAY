@@ -1,233 +1,187 @@
-import asyncio
-import os
-import random
 import json
+import random
 from datetime import datetime, timedelta
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Bot
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+import asyncio
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+)
 
-TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = -1003074172205
-ADMIN_IDS = [1953766793]
+# ---------------- CONFIG ---------------- #
+TOKEN = "8234483503:AAHqzO3yQH3zR7zTNrTQDgy0WGCspYEhwuM"
+CHANNEL_ID = -1002219330498   # 🔹 your channel ID
+ADMIN_ID = 1953766793          # 🔹 your Telegram user ID
+GIVEAWAY_FILE = "giveaway.json"
 
-# ---------------- STORAGE ----------------
-GIVEAWAY_FILE = "giveaways.json"
-
+# ---------------- JSON helpers ---------------- #
 def load_giveaways():
-    if os.path.exists(GIVEAWAY_FILE):
+    try:
         with open(GIVEAWAY_FILE, "r") as f:
             data = json.load(f)
-            # Convert end_time strings back to datetime objects
-            for g in data.values():
+        if data.get("active_giveaway"):
+            g = data["active_giveaway"]
+            if isinstance(g.get("end_time"), str):
                 g["end_time"] = datetime.fromisoformat(g["end_time"])
-            return data
-    return {}
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"active_giveaway": None, "participants": []}
 
-def save_giveaways():
+def save_giveaways(data):
+    if data.get("active_giveaway"):
+        g = data["active_giveaway"]
+        if isinstance(g.get("end_time"), datetime):
+            g["end_time"] = g["end_time"].isoformat()
     with open(GIVEAWAY_FILE, "w") as f:
-        # Convert datetime objects to ISO format strings
-        data_to_save = {k: {**v, "end_time": v["end_time"].isoformat()} for k, v in active_giveaways.items()}
-        json.dump(data_to_save, f, indent=2)
+        json.dump(data, f, indent=2)
 
-# ---------------- GIVEAWAYS ----------------
-active_giveaways = load_giveaways()
+data = load_giveaways()
 
-TITLE, WINNERS, DURATION, KEYS = range(4)
-
-# ---------------- ADMIN COMMANDS ----------------
+# ---------------- Bot Handlers ---------------- #
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ You are not authorized!")
+    await update.message.reply_text("👋 Welcome! Stay tuned for giveaways!")
+
+async def host(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You are not authorized to host giveaways.")
         return
-    keyboard = [
-        [InlineKeyboardButton("Host Giveaway", callback_data="host_giveaway")],
-        [InlineKeyboardButton("View Stats", callback_data="view_stats")]
-    ]
-    await update.message.reply_text("⚡ Admin Panel:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ---------------- HOST GIVEAWAY FLOW ----------------
-async def host_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Enter giveaway title:")
-    return TITLE
+    if data["active_giveaway"]:
+        await update.message.reply_text("⚠️ A giveaway is already active!")
+        return
 
-async def host_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['title'] = update.message.text
-    await update.message.reply_text("Enter number of winners:")
-    return WINNERS
-
-async def host_winners(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        context.user_data['winners'] = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("Please enter a valid number:")
-        return WINNERS
-    await update.message.reply_text("Enter duration in minutes:")
-    return DURATION
+        title = context.args[0]
+        winners = int(context.args[1])
+        duration = int(context.args[2])
+        reward_keys = context.args[3:]  # keys entered inline
+    except Exception:
+        await update.message.reply_text("Usage: /host <title> <winners> <duration-minutes> <key1> <key2> ...")
+        return
 
-async def host_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        context.user_data['duration'] = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("Please enter a valid duration:")
-        return DURATION
-    await update.message.reply_text("Enter digital keys (comma-separated):")
-    return KEYS
+    if len(reward_keys) < winners:
+        await update.message.reply_text("⚠️ Not enough keys for winners.")
+        return
 
-async def host_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keys_input = update.message.text
-    keys_list = [k.strip() for k in keys_input.split(",") if k.strip()]
-    if not keys_list:
-        await update.message.reply_text("❌ No keys entered. Please enter at least one key:")
-        return KEYS
+    end_time = datetime.utcnow() + timedelta(minutes=duration)
 
-    context.user_data['keys'] = keys_list
-
-    # Post giveaway in channel
-    title = context.user_data['title']
-    winners = context.user_data['winners']
-    duration = context.user_data['duration']
-    end_time = datetime.now() + timedelta(minutes=duration)
-
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎟 JOIN", callback_data="join_inline")]])
-    msg = await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=f"🎁 **GIVEAWAY** 🎁\n\n"
-             f"🏷 Prize: {title}\n"
-             f"🎯 Winners: {winners}\n"
-             f"👥 Participants: 0\n"
-             f"⏳ Time Left: {duration:02}:00:00\n\n"
-             f"✅ Tap JOIN to participate!",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-    # Save giveaway
-    active_giveaways[str(msg.message_id)] = {
+    # create giveaway object
+    data["active_giveaway"] = {
         "title": title,
         "winners": winners,
-        "participants": {},
+        "reward_keys": reward_keys,
         "end_time": end_time,
-        "channel_id": CHANNEL_ID,
-        "keys": keys_list,
-        "used_keys": []
+        "participants": [],
+        "message_id": None,
+        "chat_id": CHANNEL_ID
     }
-    save_giveaways()
+    save_giveaways(data)
 
-    asyncio.create_task(countdown_task(str(msg.message_id), context.bot))
-    await update.message.reply_text(f"✅ Giveaway hosted successfully! Message ID: {msg.message_id}")
-    return ConversationHandler.END
+    # post giveaway in channel
+    keyboard = [[InlineKeyboardButton("🎉 Join Giveaway", callback_data="join")]]
+    msg = await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=f"🎁 **{title}** 🎁\n\nReward: 🎟 Digital Keys\nWinners: {winners}\n\nParticipants: 0\nTime left: {duration}:00",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
-# ---------------- PARTICIPATION ----------------
-async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data["active_giveaway"]["message_id"] = msg.message_id
+    save_giveaways(data)
+
+    asyncio.create_task(update_giveaway(context))
+
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    msg_id = str(query.message.message_id)
-    giveaway = active_giveaways.get(msg_id)
-    if not giveaway:
-        await query.answer("❌ Giveaway not found", show_alert=True)
+
+    if not data.get("active_giveaway"):
+        await query.edit_message_text("❌ No active giveaway!")
         return
 
     user_id = query.from_user.id
     username = query.from_user.username or query.from_user.first_name
-    if user_id not in giveaway["participants"]:
-        giveaway["participants"][user_id] = username
-        save_giveaways()
-        await update_message(giveaway, msg_id, query.message.chat.id)
+    if user_id not in [p["id"] for p in data["active_giveaway"]["participants"]]:
+        data["active_giveaway"]["participants"].append({"id": user_id, "username": username})
+        save_giveaways(data)
 
-    await query.answer("🎟 You joined the giveaway!", show_alert=True)
+    await query.answer("✅ You joined the giveaway!")
 
-# ---------------- UPDATE MESSAGE ----------------
-async def update_message(giveaway, msg_id, chat_id):
-    remaining = giveaway["end_time"] - datetime.now()
-    total_seconds = max(0, int(remaining.total_seconds()))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
+async def update_giveaway(context: ContextTypes.DEFAULT_TYPE):
+    while data.get("active_giveaway"):
+        g = data["active_giveaway"]
+        now = datetime.utcnow()
+        remaining = g["end_time"] - now
 
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎟 JOIN", callback_data="join_inline")]])
-    try:
-        await Bot(TOKEN).edit_message_text(
-            chat_id=chat_id,
-            message_id=int(msg_id),
-            text=f"🎁 **GIVEAWAY** 🎁\n\n"
-                 f"🏷 Prize: {giveaway['title']}\n"
-                 f"🎯 Winners: {giveaway['winners']}\n"
-                 f"👥 Participants: {len(giveaway['participants'])}\n"
-                 f"⏳ Time Left: {hours:02}:{minutes:02}:{seconds:02}\n\n"
-                 f"✅ Tap JOIN to participate!",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-    except:
-        pass
-
-# ---------------- COUNTDOWN TASK ----------------
-async def countdown_task(msg_id, bot_instance):
-    while msg_id in active_giveaways:
-        giveaway = active_giveaways[msg_id]
-        remaining = giveaway["end_time"] - datetime.now()
         if remaining.total_seconds() <= 0:
-            await end_giveaway(msg_id, bot_instance)
+            await end_giveaway(context)
             break
-        else:
-            await update_message(giveaway, msg_id, giveaway["channel_id"])
+
+        mins, secs = divmod(int(remaining.total_seconds()), 60)
+        text = (
+            f"🎁 **{g['title']}** 🎁\n\n"
+            f"Reward: 🎟 Digital Keys\n"
+            f"Winners: {g['winners']}\n\n"
+            f"Participants: {len(g['participants'])}\n"
+            f"Time left: {mins:02}:{secs:02}"
+        )
+
+        keyboard = [[InlineKeyboardButton("🎉 Join Giveaway", callback_data="join")]]
+        try:
+            await context.bot.edit_message_text(
+                chat_id=g["chat_id"],
+                message_id=g["message_id"],
+                text=text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
         await asyncio.sleep(60)
 
-# ---------------- END GIVEAWAY ----------------
-async def end_giveaway(msg_id, bot_instance):
-    giveaway = active_giveaways.get(msg_id)
-    if not giveaway:
+async def end_giveaway(context: ContextTypes.DEFAULT_TYPE):
+    g = data["active_giveaway"]
+    if not g:
         return
 
-    participants = list(giveaway["participants"].values())
-    winners = random.sample(participants, min(giveaway["winners"], len(participants)))
-    winner_text = "\n".join([f"@{w}" for w in winners]) if winners else "No winners"
+    winners = []
+    if g["participants"]:
+        winners = random.sample(g["participants"], min(len(g["participants"]), g["winners"]))
 
-    # Send keys to winners
-    for winner_username in winners:
-        if giveaway["keys"]:
-            key = giveaway["keys"].pop(0)
-            giveaway["used_keys"].append(key)
+    win_text = "🏆 **Giveaway Ended!** 🏆\n\n"
+    win_text += f"🎁 {g['title']}\n\n"
+    if winners:
+        win_text += "👑 Winners:\n"
+        for i, w in enumerate(winners):
+            key = g["reward_keys"][i]
+            win_text += f"@{w['username']} — 🎟 `{key}`\n"
             try:
-                user = [uid for uid, uname in giveaway["participants"].items() if uname == winner_username][0]
-                await bot_instance.send_message(chat_id=user, text=f"🎉 Congratulations! You won **{giveaway['title']}**\nYour reward: `{key}`", parse_mode="Markdown")
-            except:
-                pass
+                # auto deliver key in DM
+                await context.bot.send_message(
+                    chat_id=w["id"],
+                    text=f"🎉 Congratulations! You won **{g['title']}** 🎁\n\nHere is your reward key:\n`{key}`",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                win_text += f"(❌ Could not DM {w['username']})\n"
+    else:
+        win_text += "❌ No participants joined."
 
-    await bot_instance.edit_message_text(
-        chat_id=giveaway["channel_id"],
-        message_id=int(msg_id),
-        text=f"🎉 **GIVEAWAY ENDED** 🎉\n\n🏷 Prize: {giveaway['title']}\n👥 Total Participants: {len(giveaway['participants'])}\n🏆 Winners:\n{winner_text}",
-        parse_mode="Markdown"
-    )
+    await context.bot.send_message(chat_id=g["chat_id"], text=win_text, parse_mode="Markdown")
 
-    # Remove giveaway from memory and save
-    del active_giveaways[msg_id]
-    save_giveaways()
+    data["active_giveaway"] = None
+    save_giveaways(data)
 
-# ---------------- MAIN ----------------
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+# ---------------- Main ---------------- #
+def main():
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("host", host))
+    app.add_handler(CallbackQueryHandler(join, pattern="join"))
 
-    conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(host_start, pattern="host_giveaway")],
-        states={
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, host_title)],
-            WINNERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, host_winners)],
-            DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, host_duration)],
-            KEYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, host_keys)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(join_callback, pattern="join_inline"))
-
-    # Resume countdowns for active giveaways after restart
-    for msg_id in list(active_giveaways.keys()):
-        asyncio.create_task(countdown_task(msg_id, app.bot))
-
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
